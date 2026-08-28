@@ -15,7 +15,7 @@ import os
 import tempfile
 
 joint_angles = [0, 0, 0, 0, 0, 0]
-limb_lengths = [1, 1, 1, 1, 1, 1]
+limb_lengths = [1.27, 0.87, 1.17, 0.84, 0.80, 0.82]
 
 
 def build_urdf(
