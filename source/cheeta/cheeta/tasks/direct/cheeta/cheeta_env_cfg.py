@@ -14,7 +14,7 @@
 - design vector xi in [0.8, 2.0]^6 scales the six leg segment lengths
 """
 
-from cheeta.design_builder import JOINT_GEARS, LEG_JOINT_NAMES, build_half_cheetah_asset
+from cheeta.design_builder import JOINT_GEARS, LEG_JOINT_NAMES
 
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -39,7 +39,8 @@ class CheetaEnvCfg(DirectRLEnvCfg):
     # design vector xi (paper Sec. 7.1): scale factors of the base segment
     # lengths, one per leg segment, each in [0.8, 2.0]; ones = original design
     design_vector: list[float] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    # built from design_vector in __post_init__ unless provided explicitly
+    # built from design_vector on scene setup unless provided explicitly;
+    # kept out of __post_init__ so hydra/CLI overrides of design_vector take effect
     robot_cfg: ArticulationCfg | None = None
 
     # scene
@@ -47,16 +48,15 @@ class CheetaEnvCfg(DirectRLEnvCfg):
 
     # actions are joint torques: tau = gear * action, action in [-1, 1]
     gears: list[float] = [JOINT_GEARS[name] for name in LEG_JOINT_NAMES]
-    # reward r(s) = max(v_x * reward_speed_scale, 0)
+    # reward: speed term + control cost
+    #   r = max(v_x * reward_speed_scale, 0) - ctrl_cost_weight * |a|^2   (clip_speed_reward=True)
+    #   r = v_x * reward_speed_scale         - ctrl_cost_weight * |a|^2   (clip_speed_reward=False)
+    # defaults reproduce the paper's design-independent reward r(s) = max(v_x / 10, 0);
+    # clip_speed_reward=False, ctrl_cost_weight=0.1 gives a Gym-HalfCheetah-style reward
     reward_speed_scale = 0.1
+    clip_speed_reward = True
+    ctrl_cost_weight = 0.0
     # uniform noise added to the leg joint angles on reset [rad]
     reset_noise = 0.1
     # ground friction (MuJoCo half cheetah uses 0.4)
     ground_friction = 0.4
-
-    def __post_init__(self):
-        parent_post_init = getattr(super(), "__post_init__", None)
-        if parent_post_init is not None:
-            parent_post_init()
-        if self.robot_cfg is None:
-            self.robot_cfg = build_half_cheetah_asset(self.design_vector, prim_path="/World/envs/env_.*/Robot")

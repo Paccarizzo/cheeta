@@ -9,7 +9,7 @@ import torch
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
-from cheeta.design_builder import LEG_JOINT_NAMES
+from cheeta.design_builder import LEG_JOINT_NAMES, build_half_cheetah_asset
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -32,8 +32,12 @@ class CheetaEnv(DirectRLEnv):
         self._rooty_id, _ = self.robot.find_joints("rooty")
         self._gears = torch.tensor(self.cfg.gears, device=self.device)
         self.actions = torch.zeros((self.num_envs, len(self._leg_ids)), device=self.device)
+        # per-env cumulative reward of the running episode (the design's score)
+        self._episode_return = torch.zeros(self.num_envs, device=self.device)
 
     def _setup_scene(self):
+        if self.cfg.robot_cfg is None:
+            self.cfg.robot_cfg = build_half_cheetah_asset(self.cfg.design_vector, prim_path="/World/envs/env_.*/Robot")
         self.robot = Articulation(self.cfg.robot_cfg)
         # ground plane with the task's friction
         spawn_ground_plane(
@@ -85,9 +89,15 @@ class CheetaEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        # r(s) = max(v_x / 10, 0), design-independent forward reward (paper Sec. 7.1)
+        # default: r(s) = max(v_x / 10, 0), design-independent forward reward (paper Sec. 7.1)
         forward_speed = self.robot.data.joint_vel[:, self._rootx_id[0]]
-        return torch.clamp(forward_speed * self.cfg.reward_speed_scale, min=0.0)
+        reward = forward_speed * self.cfg.reward_speed_scale
+        if self.cfg.clip_speed_reward:
+            reward = torch.clamp(reward, min=0.0)
+        if self.cfg.ctrl_cost_weight > 0.0:
+            reward -= self.cfg.ctrl_cost_weight * self.actions.square().sum(dim=-1)
+        self._episode_return += reward
+        return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -97,8 +107,12 @@ class CheetaEnv(DirectRLEnv):
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
-        # log how far these envs ran during the finished episode
-        self.extras["log"] = {"distance_x_m": self.robot.data.joint_pos[env_ids, self._rootx_id[0]].mean().item()}
+        # log score (episodic return) and distance of the finished episodes
+        self.extras["log"] = {
+            "distance_x_m": self.robot.data.joint_pos[env_ids, self._rootx_id[0]].mean().item(),
+            "episode_return": self._episode_return[env_ids].mean().item(),
+        }
+        self._episode_return[env_ids] = 0.0
         super()._reset_idx(env_ids)
 
         joint_pos = self.robot.data.default_joint_pos[env_ids]
