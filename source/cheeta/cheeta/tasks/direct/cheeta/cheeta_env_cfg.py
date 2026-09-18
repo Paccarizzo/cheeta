@@ -9,6 +9,9 @@
 
 - state (17): rel. height, pitch, 6 joint positions, horizontal speed,
   vertical speed, angular velocity, 6 joint velocities
+- design observation (+6, optional): the design vector xi mapped to [-1, 1],
+  so one policy can be trained across morphologies (the paper's population
+  network conditioned on xi)
 - actions (6): torques on the leg joints
 - reward: r(s) = max(v_x / 10, 0)
 - design vector xi in [0.8, 2.0]^6 scales the six leg segment lengths
@@ -22,15 +25,18 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
+BASE_OBS_DIM = 17
+DESIGN_OBS_DIM = 6
+
 
 @configclass
 class CheetaEnvCfg(DirectRLEnvCfg):
     # env: physics at 120 Hz, control at 60 Hz, ~1000-step episodes as in PyBullet
     decimation = 2
     episode_length_s = 16.67
-    # - spaces definition
+    # - spaces definition (observation_space is finalised by the env from observe_design)
     action_space = 6
-    observation_space = 17
+    observation_space = BASE_OBS_DIM + DESIGN_OBS_DIM
     state_space = 0
 
     # simulation
@@ -39,7 +45,12 @@ class CheetaEnvCfg(DirectRLEnvCfg):
     # design vector xi (paper Sec. 7.1): scale factors of the base segment
     # lengths, one per leg segment, each in [0.8, 2.0]; ones = original design
     design_vector: list[float] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    # built from design_vector on scene setup unless provided explicitly;
+    # several designs in one scene: env i gets design_set[i % len(design_set)];
+    # overrides design_vector and disables physics replication (heterogeneous envs)
+    design_set: list[list[float]] | None = None
+    # append the normalised design vector to the observation (design-conditioned policy)
+    observe_design: bool = True
+    # built from design_vector / design_set on scene setup unless provided explicitly;
     # kept out of __post_init__ so hydra/CLI overrides of design_vector take effect
     robot_cfg: ArticulationCfg | None = None
 

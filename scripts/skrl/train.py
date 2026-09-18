@@ -59,6 +59,10 @@ parser.add_argument(
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument("--wandb", action="store_true", default=False, help="Log the run to Weights & Biases.")
+parser.add_argument("--wandb-project", type=str, default="cheeta", help="wandb project.")
+parser.add_argument("--wandb-group", type=str, default=None, help="wandb group.")
+parser.add_argument("--wandb-name", type=str, default=None, help="wandb run name (default: log directory name).")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -181,6 +185,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # update log_dir
     log_dir = os.path.join(log_root_path, log_dir)
 
+    # Weights & Biases (skrl syncs its TensorBoard scalars into the run)
+    if args_cli.wandb:
+        agent_cfg["agent"]["experiment"]["wandb"] = True
+        agent_cfg["agent"]["experiment"]["wandb_kwargs"] = {
+            "project": args_cli.wandb_project,
+            "group": args_cli.wandb_group,
+            "name": args_cli.wandb_name or os.path.basename(log_dir),
+            "job_type": "train",
+            "config": {"task": args_cli.task, "design_vector": list(getattr(env_cfg, "design_vector", [])),
+                       "num_envs": env_cfg.scene.num_envs, "seed": agent_cfg["seed"]},
+        }
+
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
@@ -221,6 +237,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     start_time = time.time()
 
     # wrap around environment for skrl
+    # skrl's wrapper reseeds the env on its first reset with this key (default 0,
+    # captured at wrapping time), which would make every run identical
+    skrl.config.torch.key = agent_cfg["seed"]
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
 
     # configure and instantiate the skrl runner
@@ -237,6 +256,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 
+    # finish the wandb run explicitly: Isaac Sim's shutdown skips atexit hooks
+    if args_cli.wandb:
+        import wandb
+
+        wandb.finish()
     # close the simulator
     env.close()
 

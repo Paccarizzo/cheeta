@@ -72,6 +72,9 @@ agent:
     experiment_name: ""
     write_interval: auto
     checkpoint_interval: auto
+    # Weights & Biases (enabled by the --wandb flag of the training scripts)
+    wandb: False
+    wandb_kwargs: {}
 
 
 # Sequential trainer

@@ -10,20 +10,35 @@ from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
 from cheeta.design_builder import LEG_JOINT_NAMES, build_half_cheetah_asset
+from cheeta.designs import normalize_design, validate_design
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
-from .cheeta_env_cfg import CheetaEnvCfg
+from .cheeta_env_cfg import BASE_OBS_DIM, DESIGN_OBS_DIM, CheetaEnvCfg
 
 
 class CheetaEnv(DirectRLEnv):
-    """Planar half cheetah: torque-controlled legs, reward for forward speed."""
+    """Planar half cheetah: torque-controlled legs, reward for forward speed.
+
+    One design for all envs (``cfg.design_vector``) or a set of designs spread
+    over the envs (``cfg.design_set``, env i gets design i % N). With
+    ``cfg.observe_design`` the normalised design vector is part of the
+    observation so a single policy can serve every morphology.
+    """
 
     cfg: CheetaEnvCfg
 
     def __init__(self, cfg: CheetaEnvCfg, render_mode: str | None = None, **kwargs):
+        # resolve the designs before the scene is built
+        if cfg.design_set:
+            self._design_list = [validate_design(d) for d in cfg.design_set]
+            # heterogeneous envs: every env holds its own copy of the asset
+            cfg.scene.replicate_physics = False
+        else:
+            self._design_list = [validate_design(cfg.design_vector)]
+        cfg.observation_space = BASE_OBS_DIM + (DESIGN_OBS_DIM if cfg.observe_design else 0)
         super().__init__(cfg, render_mode, **kwargs)
 
         self._leg_ids, _ = self.robot.find_joints(LEG_JOINT_NAMES, preserve_order=True)
@@ -35,9 +50,36 @@ class CheetaEnv(DirectRLEnv):
         # per-env cumulative reward of the running episode (the design's score)
         self._episode_return = torch.zeros(self.num_envs, device=self.device)
 
+        # per-env design bookkeeping: design index and (normalised) design vector
+        n = len(self._design_list)
+        self.design_ids = torch.arange(self.num_envs, device=self.device) % n
+        designs = torch.tensor(self._design_list, dtype=torch.float32, device=self.device)
+        self.designs = designs[self.design_ids]  # (num_envs, 6) raw scale factors
+        normalised = torch.tensor([normalize_design(d) for d in self._design_list], dtype=torch.float32, device=self.device)
+        self._design_obs = normalised[self.design_ids]
+
+    @property
+    def num_designs(self) -> int:
+        return len(self._design_list)
+
+    @property
+    def design_list(self) -> list[list[float]]:
+        """The distinct designs in the scene, indexed by ``design_ids``."""
+        return [list(d) for d in self._design_list]
+
+    def per_design_mean(self, values: torch.Tensor) -> torch.Tensor:
+        """Mean of a per-env tensor for each distinct design -> (num_designs,)."""
+        n = self.num_designs
+        sums = torch.zeros(n, device=values.device, dtype=torch.float32).index_add_(0, self.design_ids, values.float())
+        counts = torch.zeros(n, device=values.device, dtype=torch.float32).index_add_(
+            0, self.design_ids, torch.ones_like(values, dtype=torch.float32)
+        )
+        return sums / counts.clamp(min=1.0)
+
     def _setup_scene(self):
         if self.cfg.robot_cfg is None:
-            self.cfg.robot_cfg = build_half_cheetah_asset(self.cfg.design_vector, prim_path="/World/envs/env_.*/Robot")
+            design = self._design_list if len(self._design_list) > 1 else self._design_list[0]
+            self.cfg.robot_cfg = build_half_cheetah_asset(design, prim_path="/World/envs/env_.*/Robot")
         self.robot = Articulation(self.cfg.robot_cfg)
         # ground plane with the task's friction
         spawn_ground_plane(
@@ -49,10 +91,15 @@ class CheetaEnv(DirectRLEnv):
                 )
             ),
         )
-        # clone and replicate
-        self.scene.clone_environments(copy_from_source=False)
+        if self.cfg.scene.replicate_physics:
+            # clone env_0 into the other envs (identical assets)
+            self.scene.clone_environments(copy_from_source=False)
+        else:
+            # heterogeneous envs were cloned as empty xforms by the scene and filled
+            # per env by the multi-asset spawner; only inter-env collisions remain
+            self.scene.filter_collisions(global_prim_paths=[])
         # we need to explicitly filter collisions for CPU simulation
-        if self.device == "cpu":
+        if self.device == "cpu" and self.cfg.scene.replicate_physics:
             self.scene.filter_collisions(global_prim_paths=[])
         # add articulation to scene
         self.scene.articulations["robot"] = self.robot
@@ -74,19 +121,18 @@ class CheetaEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         joint_pos = self.robot.data.joint_pos
         joint_vel = self.robot.data.joint_vel
-        obs = torch.cat(
-            (
-                joint_pos[:, self._rootz_id],  # relative height
-                joint_pos[:, self._rooty_id],  # pitch
-                joint_pos[:, self._leg_ids],  # 6 leg joint positions
-                joint_vel[:, self._rootx_id],  # horizontal speed
-                joint_vel[:, self._rootz_id],  # vertical speed
-                joint_vel[:, self._rooty_id],  # angular velocity
-                joint_vel[:, self._leg_ids],  # 6 leg joint velocities
-            ),
-            dim=-1,
-        )
-        return {"policy": obs}
+        parts = [
+            joint_pos[:, self._rootz_id],  # relative height
+            joint_pos[:, self._rooty_id],  # pitch
+            joint_pos[:, self._leg_ids],  # 6 leg joint positions
+            joint_vel[:, self._rootx_id],  # horizontal speed
+            joint_vel[:, self._rootz_id],  # vertical speed
+            joint_vel[:, self._rooty_id],  # angular velocity
+            joint_vel[:, self._leg_ids],  # 6 leg joint velocities
+        ]
+        if self.cfg.observe_design:
+            parts.append(self._design_obs)  # 6 normalised design scales
+        return {"policy": torch.cat(parts, dim=-1)}
 
     def _get_rewards(self) -> torch.Tensor:
         # default: r(s) = max(v_x / 10, 0), design-independent forward reward (paper Sec. 7.1)

@@ -13,7 +13,9 @@ is one ask/tell batch:
 Policy inheritance is decoupled from the optimizer: every candidate
 warm-starts from the checkpoint of the nearest previously evaluated design
 (Euclidean distance in design space), so "the policy almost works already"
-holds no matter which algorithm proposed the design.
+holds no matter which algorithm proposed the design. With
+--general-checkpoint the design-conditioned general policy is the warm start
+whenever no evaluated design exists yet (and with --inherit general, always).
 
 Useful --optimizer values: CMA (default), TBPSA (built for noisy scores),
 PSO (what Luck et al. used), NGOpt (nevergrad's auto-selector),
@@ -34,17 +36,15 @@ import csv
 import json
 import math
 import os
-import subprocess
-import sys
 from datetime import datetime
 
 import nevergrad as ng
 import numpy as np
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WORKER = os.path.join(REPO_ROOT, "scripts", "coadapt", "train_design.py")
-DESIGN_BOUNDS = (0.8, 2.0)  # paper Sec. 7.1
-DESIGN_DIM = 6
+from _common import REPO_ROOT, add_wandb_args, designs, run_worker, wandb_init_driver, wandb_worker_args, worker_command
+
+DESIGN_BOUNDS = designs.DESIGN_BOUNDS
+DESIGN_DIM = designs.DESIGN_DIM
 # loss handed to the optimizer when a candidate could not be scored (rank-based
 # optimizers only need it to be finite and worse than everything real)
 FAILED_LOSS = 1.0e9
@@ -57,11 +57,16 @@ parser.add_argument("--population", type=int, default=8, help="candidates per ba
 parser.add_argument("--sigma", type=float, default=0.15, help="initial mutation std dev on the scale factors")
 parser.add_argument("--no-warm-start", action="store_true",
                     help="train every candidate from scratch instead of the nearest evaluated design's checkpoint")
+parser.add_argument("--general-checkpoint", type=str, default=None,
+                    help="design-conditioned policy used as warm start when no evaluated design exists")
+parser.add_argument("--inherit", type=str, default="nearest", choices=["nearest", "general"],
+                    help="warm start: nearest evaluated design's policy, or always the general policy")
 parser.add_argument("--num_envs", type=int, default=256, help="parallel envs per candidate")
 parser.add_argument("--iterations", type=int, default=100, help="PPO iterations per candidate")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--run-dir", type=str, default=None, help="run directory (set to an old run to resume)")
 parser.add_argument("--device", type=str, default=None, help="forwarded to the worker, e.g. cuda:0")
+add_wandb_args(parser)
 args = parser.parse_args()
 
 
@@ -75,31 +80,18 @@ def nearest_checkpoint(design: list[float], archive: list[dict]) -> str | None:
     return best_ckpt
 
 
-def run_generation(candidates: list[dict], gen_dir: str) -> None:
+def run_generation(candidates: list[dict], gen_dir: str, gen: int, run_name: str, group: str) -> None:
     """One worker process per candidate; finished candidates are skipped."""
     for cand in candidates:
         out_dir = os.path.join(gen_dir, cand["id"])
-        if os.path.exists(os.path.join(out_dir, "result.json")):
-            print(f"[evolve-ng] {cand['id']}: already done, skipping")
-            continue
-        cmd = [
-            sys.executable, "-u", WORKER,
-            "--design", *[str(x) for x in cand["design"]],
-            "--out", out_dir,
-            "--num_envs", str(args.num_envs),
-            "--iterations", str(args.iterations),
-            "--seed", str(args.seed),
-            "--headless",
-        ]
-        if cand.get("checkpoint"):
-            cmd += ["--checkpoint", cand["checkpoint"]]
-        if args.device:
-            cmd += ["--device", args.device]
+        checkpoint = cand.get("checkpoint") or args.general_checkpoint
+        cmd = worker_command(out_dir, num_envs=args.num_envs, iterations=args.iterations, seed=args.seed,
+                             design=cand["design"], checkpoint=checkpoint, device=args.device,
+                             extra=wandb_worker_args(args, name=f"{run_name}-g{gen:02d}-{cand['id']}", group=group,
+                                                     job_type="candidate", tags=[f"gen{gen}"]))
         print(f"[evolve-ng] {cand['id']}: training design {cand['design']}"
-              + (f" (warm start: {cand['checkpoint']})" if cand.get("checkpoint") else ""))
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, check=False)
-        if proc.returncode != 0:
-            print(f"[evolve-ng] WARNING: worker for {cand['id']} exited with code {proc.returncode}")
+              + (f" (warm start: {checkpoint})" if checkpoint else ""))
+        run_worker(cmd, cand["id"], retries=0)
 
 
 def collect_results(gen_dir: str, candidates: list[dict]) -> list[dict]:
@@ -121,6 +113,11 @@ def collect_results(gen_dir: str, candidates: list[dict]) -> list[dict]:
 def main():
     run_dir = args.run_dir or os.path.join(REPO_ROOT, "logs", "coadapt", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(run_dir, exist_ok=True)
+    run_name = os.path.basename(os.path.normpath(run_dir))
+    group = args.wandb_group or f"evolve-ng-{run_name}"
+    if args.general_checkpoint:
+        args.general_checkpoint = os.path.abspath(args.general_checkpoint)
+    wb = wandb_init_driver(args, name=f"{run_name}-driver", group=group, job_type="evolve-ng-driver", config=vars(args))
     history_path = os.path.join(run_dir, "history.csv")
     new_history = not os.path.exists(history_path)
     history = open(history_path, "a", newline="")
@@ -165,19 +162,24 @@ def main():
             for i in range(args.population):
                 cand = optimizer.ask()
                 design = [round(float(x), 4) for x in cand.value]
-                checkpoint = None if args.no_warm_start else nearest_checkpoint(design, archive)
+                if args.no_warm_start:
+                    checkpoint = None
+                elif args.inherit == "general" and args.general_checkpoint:
+                    checkpoint = args.general_checkpoint
+                else:
+                    checkpoint = nearest_checkpoint(design, archive)
                 candidates.append({"id": f"cand_{i:02d}", "design": design, "checkpoint": checkpoint})
                 ng_cands.append(cand)
             with open(designs_file, "w") as f:
                 json.dump(candidates, f, indent=2)
 
         print(f"\n[evolve-ng] === generation {gen} ({len(candidates)} candidates, {args.optimizer}) ===")
-        run_generation(candidates, gen_dir)
+        run_generation(candidates, gen_dir, gen, run_name, group)
         results = collect_results(gen_dir, candidates)
         if any(r["score"] == float("-inf") for r in results):
             # a worker may have crashed; one retry per unfinished candidate
             print("[evolve-ng] retrying unfinished candidate(s)")
-            run_generation(candidates, gen_dir)
+            run_generation(candidates, gen_dir, gen, run_name, group)
             results = collect_results(gen_dir, candidates)
 
         for ng_cand, result in zip(ng_cands, results):
@@ -200,8 +202,17 @@ def main():
                 json.dump(best, f, indent=2)
         print(f"[evolve-ng] gen {gen} best: {top['id']} score={top['score']:.2f} "
               f"dist={top.get('distance_x_m', float('nan')):.2f} m design={top['design']}")
+        if wb is not None:
+            import wandb
+
+            finite = [r["score"] for r in results if math.isfinite(r["score"])]
+            wandb.log({"generation": gen, "best_score": top["score"], "best_score_so_far": best["score"],
+                       "score_mean": sum(finite) / len(finite) if finite else float("nan")}, step=gen)
 
     history.close()
+    if wb is not None:
+        wb.summary.update({"best_score": best["score"], "best_design": best["design"]})
+        wb.finish()
     recommendation = [round(float(x), 4) for x in optimizer.provide_recommendation().value]
     print("\n[evolve-ng] done.")
     print(f"[evolve-ng] best evaluated (gen {best['generation']}): score={best['score']:.2f} design={best['design']}")

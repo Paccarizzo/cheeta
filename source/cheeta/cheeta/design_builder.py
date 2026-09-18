@@ -20,12 +20,15 @@ import os
 import tempfile
 from collections.abc import Sequence
 
-LEG_JOINT_NAMES = ["bthigh", "bshin", "bfoot", "fthigh", "fshin", "ffoot"]
+from cheeta.designs import DESIGN_BOUNDS, DESIGN_NAMES, design_key, validate_design
+
+LEG_JOINT_NAMES = list(DESIGN_NAMES)
 ROOT_JOINT_NAMES = ["rootx", "rootz", "rooty"]
 
 # base segment lengths scaled by the design vector (paper Sec. 7.1)
 BASE_SEGMENT_LENGTHS = (0.29, 0.30, 0.188, 0.29, 0.30, 0.188)
-DESIGN_BOUNDS = (0.8, 2.0)
+# clearance between the toes and the ground in the spawn pose
+SPAWN_CLEARANCE = 0.05
 
 # passive joint springs/dampers and actuator gears from the MuJoCo/PyBullet
 # half_cheetah model the paper builds on
@@ -95,12 +98,14 @@ def _leg_joint(name: str, parent: str, xyz: tuple[float, float, float]) -> str:
     )
 
 
-def _root_joint(name: str, jtype: str, parent: str, child: str, axis: str, limit: float) -> str:
+def _root_joint(
+    name: str, jtype: str, parent: str, child: str, axis: str, limit: float, z: float = 0.0
+) -> str:
     return (
         f'  <joint name="{name}" type="{jtype}">\n'
         f'    <parent link="{parent}"/>\n'
         f'    <child link="{child}"/>\n'
-        f'    <origin xyz="0 0 0" rpy="0 0 0"/>\n'
+        f'    <origin xyz="0 0 {z}" rpy="0 0 0"/>\n'
         f'    <axis xyz="{axis}"/>\n'
         f'    <limit lower="{-limit}" upper="{limit}" effort="1e6" velocity="1000"/>\n'
         f"  </joint>"
@@ -108,9 +113,7 @@ def _root_joint(name: str, jtype: str, parent: str, child: str, axis: str, limit
 
 
 def segment_lengths_from_design(design: Sequence[float]) -> list[float]:
-    if len(design) != 6:
-        raise ValueError(f"design vector must have 6 entries, got {len(design)}")
-    return [x * base for x, base in zip(design, BASE_SEGMENT_LENGTHS)]
+    return [x * base for x, base in zip(validate_design(design), BASE_SEGMENT_LENGTHS)]
 
 
 def standing_height(segment_lengths: Sequence[float]) -> float:
@@ -127,8 +130,15 @@ def standing_height(segment_lengths: Sequence[float]) -> float:
 
 
 def half_cheetah_urdf(segment_lengths: Sequence[float]) -> str:
-    """URDF for the planar half cheetah with the given six segment lengths [m]."""
+    """URDF for the planar half cheetah with the given six segment lengths [m].
+
+    The fixed world link sits at the origin; the planar root chain lifts the
+    torso to its standing height, so every design shares the same root pose
+    (needed when several designs live in one scene) and rootz = 0 is the
+    spawn height.
+    """
     lengths = dict(zip(LEG_JOINT_NAMES, segment_lengths))
+    spawn_height = standing_height(segment_lengths) + SPAWN_CLEARANCE
     r = LIMB_RADIUS
     torso_mass = DENSITY * math.pi * r * r * TORSO_LENGTH
     t_axial = torso_mass * r * r / 2.0
@@ -138,7 +148,7 @@ def half_cheetah_urdf(segment_lengths: Sequence[float]) -> str:
     parts = ['<robot name="half_cheetah">']
     # planar root: world -(rootx)-> slide_x -(rootz)-> slide_z -(rooty)-> torso
     parts.append(_small_link("world"))
-    parts.append(_root_joint("rootx", "prismatic", "world", "slide_x", "1 0 0", 1000.0))
+    parts.append(_root_joint("rootx", "prismatic", "world", "slide_x", "1 0 0", 1000.0, z=spawn_height))
     parts.append(_small_link("slide_x"))
     parts.append(_root_joint("rootz", "prismatic", "slide_x", "slide_z", "0 0 1", 1000.0))
     parts.append(_small_link("slide_z"))
@@ -180,30 +190,24 @@ def half_cheetah_urdf(segment_lengths: Sequence[float]) -> str:
     return "\n".join(parts)
 
 
-def build_half_cheetah_asset(
-    design: Sequence[float] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-    prim_path: str = "/World/envs/env_.*/Robot",
-    output_dir: str | None = None,
-):
-    """Create the ArticulationCfg for a half cheetah with design vector ``design``.
+def build_half_cheetah_usd(design: Sequence[float], output_dir: str | None = None, force: bool = False) -> str:
+    """Write the URDF for ``design`` and convert it to USD; returns the USD path.
 
-    ``design`` are the six scale factors xi of the paper; segment lengths are
-    xi_i * base_i. Requires the Isaac Sim app to be running (URDF -> USD).
+    Assets are cached per design under ``%TEMP%/cheeta_assets/half_cheetah/<key>``
+    (or ``output_dir``); the conversion is skipped when the URDF is unchanged.
+    Requires the Isaac Sim app to be running.
     """
-    import isaaclab.sim as sim_utils
-    from isaaclab.actuators import ImplicitActuatorCfg
-    from isaaclab.assets import ArticulationCfg
     from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 
     lengths = segment_lengths_from_design(design)
-
     if output_dir is None:
-        key = "_".join(f"{v:.4g}" for v in design)
-        output_dir = os.path.join(tempfile.gettempdir(), "cheeta_assets", "half_cheetah", key)
+        output_dir = os.path.join(tempfile.gettempdir(), "cheeta_assets", "half_cheetah", design_key(design))
     os.makedirs(output_dir, exist_ok=True)
     urdf_path = os.path.join(output_dir, "half_cheetah.urdf")
-    with open(urdf_path, "w") as f:
-        f.write(half_cheetah_urdf(lengths))
+    urdf = half_cheetah_urdf(lengths)
+    if not os.path.exists(urdf_path) or open(urdf_path).read() != urdf:
+        with open(urdf_path, "w") as f:
+            f.write(urdf)
 
     converter_cfg = UrdfConverterCfg(
         asset_path=urdf_path,
@@ -211,28 +215,55 @@ def build_half_cheetah_asset(
         usd_file_name="half_cheetah.usd",
         fix_base=True,  # the world link is fixed; motion happens in the root joints
         merge_fixed_joints=True,
-        force_usd_conversion=True,
+        force_usd_conversion=force,
         joint_drive=UrdfConverterCfg.JointDriveCfg(
             target_type="position",
             gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0.0, damping=0.0),
         ),
     )
-    usd_path = UrdfConverter(converter_cfg).usd_path
+    return UrdfConverter(converter_cfg).usd_path
+
+
+def build_half_cheetah_asset(
+    design: Sequence[float] | Sequence[Sequence[float]] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    prim_path: str = "/World/envs/env_.*/Robot",
+    output_dir: str | None = None,
+):
+    """Create the ArticulationCfg for a half cheetah with design vector ``design``.
+
+    ``design`` are the six scale factors xi of the paper; segment lengths are
+    xi_i * base_i. A list of designs gives a multi-asset config: env ``i``
+    receives design ``i % len(designs)`` (requires ``replicate_physics=False``
+    in the scene). Requires the Isaac Sim app to be running (URDF -> USD).
+    """
+    import isaaclab.sim as sim_utils
+    from isaaclab.actuators import ImplicitActuatorCfg
+    from isaaclab.assets import ArticulationCfg
+
+    multi = len(design) > 0 and isinstance(design[0], Sequence)
+    designs = [validate_design(d) for d in design] if multi else [validate_design(design)]
+    usd_paths = [build_half_cheetah_usd(d, output_dir=None if multi else output_dir) for d in designs]
+
+    spawn_kwargs = dict(
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=10.0),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=0,
+        ),
+    )
+    if multi:
+        spawn = sim_utils.MultiUsdFileCfg(usd_path=usd_paths, random_choice=False, **spawn_kwargs)
+    else:
+        spawn = sim_utils.UsdFileCfg(usd_path=usd_paths[0], **spawn_kwargs)
 
     return ArticulationCfg(
         prim_path=prim_path,
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=usd_path,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(max_depenetration_velocity=10.0),
-            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=False,
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=0,
-            ),
-        ),
-        # joint angle 0 = rest pose; drop the toes just above the ground
+        spawn=spawn,
+        # joint angle 0 = rest pose; the URDF already lifts the torso so the
+        # toes hang just above the ground, hence the root sits at the origin
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, standing_height(lengths) + 0.05),
+            pos=(0.0, 0.0, 0.0),
             joint_pos={".*": 0.0},
         ),
         actuators={
