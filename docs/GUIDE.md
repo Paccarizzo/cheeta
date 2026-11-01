@@ -134,6 +134,32 @@ checkpoint (the original loop). `scripts/coadapt/evolve_ng.py` is the same
 loop driven by a nevergrad optimizer (CMA-ES, PSO, ...) instead of the GA; it
 also accepts `--general-checkpoint`.
 
+**Comparable scores across generations.** With policy inheritance, a design's
+score also reflects how much training its lineage has accumulated (elites keep
+training, children start from their parent's policy), so the best score rises
+even if the designs do not improve. For a clean "design performance over
+generations" curve, train every candidate from scratch with the same budget and
+let the elites carry their score instead of retraining:
+
+```
+python scripts/coadapt/evolve.py --generations 5 --population 10 --elites 4 --immigrants 0 ^
+    --inherit scratch --elite-mode keep --no-identity --num_envs 1024 --iterations 200
+```
+
+(`--no-identity` makes generation 0 all random; by default its first design is
+the unscaled cheetah.) Then retrain the winners with new seeds and plot the run:
+
+```
+python scripts/coadapt/recheck_designs.py --run-dir logs\coadapt\<run> --top 3 --seeds 43 44 --identity
+python scripts/coadapt/plot_evolution.py --run-dir logs\coadapt\<run>
+```
+
+`recheck_designs.py` writes `recheck\recheck.csv` (the best designs and the
+unscaled cheetah, one row per seed). `plot_evolution.py` needs only matplotlib
+and numpy (any Python, not the Isaac one) and writes `plots\`: score per
+generation, the six scale factors per generation, learning curves, the seed
+check, plus `summary_by_generation.csv` and `candidates.csv`.
+
 Outputs, under `logs\coadapt\<timestamp>\`:
 
 - `history.csv` — every candidate ever proposed: generation, role, parent,
@@ -224,6 +250,8 @@ Without `--checkpoint` the design runs passively (zero torques).
 | `scripts/coadapt/train_general.py` | train the design-conditioned general policy |
 | `scripts/coadapt/evolve.py` | evolutionary co-adaptation driver (screening + fine-tuning) |
 | `scripts/coadapt/evolve_ng.py` | nevergrad-driven variant |
+| `scripts/coadapt/recheck_designs.py` | retrain the best designs of an evolve run with new seeds |
+| `scripts/coadapt/plot_evolution.py` | plots + tables of an evolve run (matplotlib, no Isaac Sim) |
 | `scripts/coadapt/benchmark_metrics.py` | correlate cheap RL metrics with final design scores |
 | `scripts/coadapt/play_design.py` | watch a design + checkpoint |
 | `scripts/list_envs.py`, `zero_agent.py`, `random_agent.py` | template utilities |

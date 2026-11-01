@@ -8,14 +8,18 @@ Loop per generation:
      by the general, design-conditioned policy in ONE worker process (all
      designs in one scene, no training); the critic's value at the initial
      state V(s0) is recorded as well
-  3. specialise: elites keep training their own policy; of the new candidates
+  3. specialise: elites keep training their own policy (--elite-mode train) or
+     carry their score unchanged (--elite-mode keep); of the new candidates
      the --train-top best by --select-by are fine-tuned, each in its own
-     worker process, warm-started from the parent's policy (--inherit parent)
-     or from the general policy (--inherit general)
+     worker process, warm-started from the parent's policy (--inherit parent),
+     from the general policy (--inherit general) or from scratch (--inherit scratch)
   4. the fine-tuned score is the fitness; screened-only candidates keep their
      zero-shot score and cannot become elites
 
 Without --general-checkpoint every candidate is trained (the original loop).
+For scores that are comparable across generations, use --inherit scratch
+--elite-mode keep: every design gets the same training budget from a fresh
+policy, so a rising best score means better designs, not longer training.
 Screening metrics of the trained candidates are compared with their trained
 scores every generation (Spearman rank correlation, logged to history/wandb),
 which is the cheapest test of how useful a selection metric is.
@@ -52,8 +56,12 @@ parser.add_argument("--train-top", type=int, default=None,
                     help="new candidates fine-tuned per generation (default: all); elites always continue")
 parser.add_argument("--select-by", type=str, default="zero_shot", choices=SELECT_METRICS,
                     help="screening metric that picks the candidates to fine-tune")
-parser.add_argument("--inherit", type=str, default="parent", choices=["parent", "general"],
-                    help="warm start of children: parent's specialised policy or the general policy")
+parser.add_argument("--inherit", type=str, default="parent", choices=["parent", "general", "scratch"],
+                    help="warm start of children: parent's specialised policy, the general policy or none")
+parser.add_argument("--elite-mode", type=str, default="train", choices=["train", "keep"],
+                    help="elites continue training their policy (train) or keep their score without training (keep)")
+parser.add_argument("--no-identity", action="store_true",
+                    help="generation 0 is all random designs (default: the first one is the unscaled cheetah)")
 parser.add_argument("--screen-envs", type=int, default=None, help="envs for screening (default: num_envs)")
 parser.add_argument("--num_envs", type=int, default=256, help="parallel envs per fine-tuned candidate")
 parser.add_argument("--iterations", type=int, default=100, help="PPO iterations per candidate per generation")
@@ -77,13 +85,17 @@ def propose(gen: int, survivors: list[dict], rng: random.Random, sigma: float) -
                       "parent": parent, "checkpoint": checkpoint})
 
     if gen == 0 or not survivors:
-        add(designs.IDENTITY_DESIGN, "seed")
+        if not args.no_identity:
+            add(designs.IDENTITY_DESIGN, "seed")
         while len(cands) < args.population:
             add(designs.random_design(rng), "immigrant")
         return cands
     elites = survivors[: args.elites]
     for elite in elites:
         add(elite["design"], "elite", parent=elite["id"], checkpoint=elite["checkpoint"])
+        if args.elite_mode == "keep":
+            # stored in designs.json, so a resumed run carries the same score
+            cands[-1]["kept"] = {k: elite.get(k) for k in ("score", "distance_x_m", "checkpoint", "train_metrics")}
     for _ in range(args.immigrants):
         if len(cands) < args.population:
             add(designs.random_design(rng), "immigrant")
@@ -122,8 +134,8 @@ def screen(candidates: list[dict], gen_dir: str, gen: int, run_name: str, group:
 
 
 def choose_training_set(candidates: list[dict], rng: random.Random) -> list[dict]:
-    """Elites always train; the best --train-top new candidates by --select-by join them."""
-    elites = [c for c in candidates if c["role"] == "elite"]
+    """Elites train (unless kept); the best --train-top new candidates by --select-by join them."""
+    elites = [c for c in candidates if c["role"] == "elite" and not c.get("kept")]
     new = [c for c in candidates if c["role"] != "elite"]
     if args.train_top is None or args.train_top >= len(new) or args.select_by == "none":
         return elites + new
@@ -139,7 +151,7 @@ def choose_training_set(candidates: list[dict], rng: random.Random) -> list[dict
 def train(candidates: list[dict], gen_dir: str, gen: int, run_name: str, group: str) -> None:
     for cand in candidates:
         out_dir = os.path.join(gen_dir, cand["id"])
-        checkpoint = cand.get("checkpoint") or args.general_checkpoint
+        checkpoint = cand.get("checkpoint") or (args.general_checkpoint if args.inherit != "scratch" else None)
         extra = list(wandb_worker_args(args, name=f"{run_name}-g{gen:02d}-{cand['id']}", group=group,
                                        job_type="candidate", tags=[cand["role"], f"gen{gen}"]))
         if args.no_probe:
@@ -157,7 +169,9 @@ def collect(candidates: list[dict], trained: set[str], gen_dir: str) -> list[dic
         row = {**cand, "trained": False, "score": cand.get("zero_shot_score", -math.inf),
                "distance_x_m": cand.get("zero_shot_distance_x_m", float("nan")), "checkpoint": None,
                "train_metrics": None}
-        if cand["id"] in trained:
+        if cand.get("kept"):
+            row.update({"trained": True, **cand["kept"]})
+        elif cand["id"] in trained:
             result = load_result(os.path.join(gen_dir, cand["id"]))
             if result is None:
                 print(f"[evolve] WARNING: no result for {cand['id']}, keeping its screening score")
@@ -193,12 +207,11 @@ def main():
     save_json(vars(args), os.path.join(run_dir, "config.json"))
     wb = wandb_init_driver(args, name=f"{run_name}-driver", group=group, job_type="evolve-driver", config=vars(args))
 
+    # rewritten from scratch: a resumed run re-collects every generation from the job results
     history_path = os.path.join(run_dir, "history.csv")
-    new_history = not os.path.exists(history_path)
-    history = open(history_path, "a", newline="")
+    history = open(history_path, "w", newline="")
     writer = csv.writer(history)
-    if new_history:
-        writer.writerow(HISTORY_COLUMNS)
+    writer.writerow(HISTORY_COLUMNS)
 
     survivors: list[dict] = []
     sigma = args.sigma
@@ -238,7 +251,7 @@ def main():
             best = {"generation": gen, **{k: top.get(k) for k in ("id", "design", "score", "distance_x_m", "checkpoint")},
                     "general_checkpoint": args.general_checkpoint}
             save_json(best, best_path)
-        trained_rows = [r for r in results if r["trained"]]
+        trained_rows = [r for r in results if r["trained"] and not r.get("kept")]  # trained this generation
         zs = [r.get("zero_shot_score") for r in trained_rows]
         vs = [r.get("value_s0") for r in trained_rows]
         sc = [r["score"] for r in trained_rows]
