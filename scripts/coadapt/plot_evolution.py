@@ -41,7 +41,6 @@ parser = argparse.ArgumentParser(description="Plot an evolve.py run.")
 parser.add_argument("--run-dir", type=str, required=True)
 parser.add_argument("--parents", type=int, default=None, help="top designs that parent the next generation "
                     "(default: --elites of the run)")
-args = parser.parse_args()
 
 
 def style(ax, ylabel: str | None = None, xlabel: str | None = None) -> None:
@@ -226,9 +225,9 @@ def plot_designs(rows, summary, out):
 def training_return(r: dict) -> tuple[np.ndarray, np.ndarray] | None:
     """Training reward per step averaged over the last episode, scaled to an episode return.
 
-    All envs start together and end only by timeout, so they reset in sync and the raw
-    per-iteration reward is a sawtooth with the episode's period; a rolling mean over one
-    episode removes it and puts the curve in the units of the score."""
+    Without --random-episode-start all envs start together and end only by timeout, so they
+    reset in sync and the raw per-iteration reward is a sawtooth with the episode's period;
+    a rolling mean over one episode removes it and puts the curve in the units of the score."""
     pts = r["metrics"]["series"].get("reward_step", []) if r["metrics"] else []
     if not pts:
         return None
@@ -316,6 +315,7 @@ def plot_seed_check(recheck: list[dict], run_seed: int, out: str) -> None:
 
 
 def main():
+    args = parser.parse_args()  # parsed here so plot_convergence.py can import the helpers
     run_dir = os.path.abspath(args.run_dir)
     config = _load(os.path.join(run_dir, "config.json")) or {}
     n_parents = args.parents or config.get("elites", 4)

@@ -9,9 +9,17 @@ reference the evolved designs should beat.
 
     python scripts/coadapt/recheck_designs.py --run-dir logs/coadapt/<run> --top 3 --seeds 43 44 --identity
 
-Output: <run-dir>/recheck/<label>_s<seed>/result.json per job and
-<run-dir>/recheck/recheck.csv (one row per design and seed, the run's
-original score included as the run seed's row). Finished jobs are skipped.
+With another budget (--iterations, --random-episode-start) the run's own
+scores are not comparable, so every design is retrained with the run's seed
+too; use --out-name to keep it apart from the plain recheck, e.g. a
+convergence check:
+
+    python scripts/coadapt/recheck_designs.py --run-dir logs/coadapt/<run> --identity ^
+        --iterations 800 --random-episode-start --out-name converge_800
+
+Output: <run-dir>/<out-name>/<label>_s<seed>/result.json per job and
+<run-dir>/<out-name>/recheck.csv (one row per design and seed; with the run's
+budget the run's original score is the run seed's row). Finished jobs are skipped.
 """
 
 import argparse
@@ -25,6 +33,9 @@ parser.add_argument("--run-dir", type=str, required=True, help="evolve.py run di
 parser.add_argument("--top", type=int, default=3, help="number of best distinct designs to retrain")
 parser.add_argument("--seeds", type=int, nargs="+", default=[43, 44], help="new training seeds")
 parser.add_argument("--identity", action="store_true", help="also train the unscaled cheetah")
+parser.add_argument("--iterations", type=int, default=None, help="PPO iterations (default: the run's)")
+parser.add_argument("--random-episode-start", action="store_true", help="forwarded to the worker")
+parser.add_argument("--out-name", type=str, default="recheck", help="output subdirectory of the run")
 parser.add_argument("--device", type=str, default=None, help="forwarded to the worker, e.g. cuda:0")
 args = parser.parse_args()
 
@@ -50,24 +61,30 @@ def best_designs(history_path: str, n: int) -> list[dict]:
 def main():
     run_dir = os.path.abspath(args.run_dir)
     config = load_json(os.path.join(run_dir, "config.json"))
-    out_root = os.path.join(run_dir, "recheck")
+    out_root = os.path.join(run_dir, args.out_name)
+    iterations = args.iterations or config["iterations"]
+    # the run trained with synchronised episode starts
+    same_budget = iterations == config["iterations"] and not args.random_episode_start
+    seeds = list(dict.fromkeys([config["seed"], *args.seeds]))
     targets = best_designs(os.path.join(run_dir, "history.csv"), args.top)
-    jobs = [(t, seed) for t in targets for seed in args.seeds]
+    jobs = [(t, seed) for t in targets for seed in seeds if not (same_budget and seed == config["seed"])]
     if args.identity:
         identity = {"label": "identity", "design": list(designs.IDENTITY_DESIGN), "score": None}
-        jobs += [(identity, seed) for seed in [config["seed"], *args.seeds]]
-    save_json({"targets": targets, "seeds": args.seeds, "identity": args.identity}, os.path.join(out_root, "config.json"))
+        jobs += [(identity, seed) for seed in seeds]
+    save_json({"targets": targets, "seeds": args.seeds, "identity": args.identity, "iterations": iterations,
+               "num_envs": config["num_envs"], "random_episode_start": args.random_episode_start},
+              os.path.join(out_root, "config.json"))
 
     for target, seed in jobs:
         label = f"{target['label']}_s{seed}"
         cmd = worker_command(os.path.join(out_root, label), num_envs=config["num_envs"],
-                             iterations=config["iterations"], seed=seed, design=target["design"],
-                             device=args.device)
+                             iterations=iterations, seed=seed, design=target["design"],
+                             device=args.device, random_episode_start=args.random_episode_start)
         print(f"[recheck] {label}: design {target['design']}")
         run_worker(cmd, label)
 
     rows = []
-    for target in targets:
+    for target in targets if same_budget else []:
         rows.append({"label": target["label"], "seed": config["seed"], "source": "evolution",
                      "score": target["score"], "distance_x_m": target["distance_x_m"], "design": target["design"]})
     for target, seed in jobs:

@@ -160,6 +160,25 @@ and numpy (any Python, not the Isaac one) and writes `plots\`: score per
 generation, the six scale factors per generation, learning curves, the seed
 check, plus `summary_by_generation.csv` and `candidates.csv`.
 
+**Training length and synchronised resets.** Episodes end only by timeout, so
+by default every env resets on the same step and each PPO rollout sees a
+single phase of the episode (the training reward is a sawtooth with a
+31-iteration period). `train_design.py --random-episode-start` starts training
+with random episode lengths, as rsl_rl's `init_at_random_ep_len`; the
+evaluation resets all envs and is unaffected. To check how long to train
+before the design ranking settles, retrain the best designs with a longer
+budget and compare against the run's own budget:
+
+```
+python scripts/coadapt/recheck_designs.py --run-dir logs\coadapt\<run> --top 3 --seeds 43 44 --identity ^
+    --iterations 800 --random-episode-start --out-name converge_800
+python scripts/coadapt/plot_convergence.py --run-dir logs\coadapt\<run> --name converge_800
+```
+
+`plot_convergence.py` writes `converge_800\plots\`: training return per design
+and seed for both budgets, the seed-mean training return over training (does
+the ranking settle?), the evaluation scores of both budgets and `convergence.csv`.
+
 Outputs, under `logs\coadapt\<timestamp>\`:
 
 - `history.csv` — every candidate ever proposed: generation, role, parent,
@@ -252,6 +271,7 @@ Without `--checkpoint` the design runs passively (zero torques).
 | `scripts/coadapt/evolve_ng.py` | nevergrad-driven variant |
 | `scripts/coadapt/recheck_designs.py` | retrain the best designs of an evolve run with new seeds |
 | `scripts/coadapt/plot_evolution.py` | plots + tables of an evolve run (matplotlib, no Isaac Sim) |
+| `scripts/coadapt/plot_convergence.py` | plots of a longer-budget recheck: training length and ranking stability |
 | `scripts/coadapt/benchmark_metrics.py` | correlate cheap RL metrics with final design scores |
 | `scripts/coadapt/play_design.py` | watch a design + checkpoint |
 | `scripts/list_envs.py`, `zero_agent.py`, `random_agent.py` | template utilities |

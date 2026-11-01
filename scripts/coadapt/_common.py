@@ -93,6 +93,7 @@ def worker_command(
     design_seed: int = 0,
     checkpoint: str | None = None,
     device: str | None = None,
+    random_episode_start: bool = False,
     extra: Sequence[str] = (),
 ) -> list[str]:
     """Command line for one worker run (train + score, or eval-only with iterations=0).
@@ -118,6 +119,8 @@ def worker_command(
         cmd += ["--checkpoint", checkpoint]
     if device:
         cmd += ["--device", device]
+    if random_episode_start:
+        cmd += ["--random-episode-start"]
     cmd += list(extra)
     return cmd
 

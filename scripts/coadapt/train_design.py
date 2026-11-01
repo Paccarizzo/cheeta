@@ -40,6 +40,8 @@ parser.add_argument("--iterations", type=int, default=100, help="PPO iterations 
 parser.add_argument("--seed", type=int, default=42, help="seed")
 parser.add_argument("--no-design-obs", action="store_true", help="hide the design vector from the policy")
 parser.add_argument("--no-probe", action="store_true", help="skip the zero-shot / critic probe before training")
+parser.add_argument("--random-episode-start", action="store_true",
+                    help="start training with random episode lengths so the envs do not all time out on the same step")
 group = parser.add_argument_group("wandb")
 group.add_argument("--wandb", action="store_true", help="log this run to Weights & Biases")
 group.add_argument("--wandb-project", type=str, default="cheeta")
@@ -340,6 +342,7 @@ def main() -> dict:
         "num_envs": args_cli.num_envs,
         "seed": args_cli.seed,
         "observe_design": env_cfg.observe_design,
+        "random_episode_start": args_cli.random_episode_start,
         "build_time_s": round(build_time, 1),
         "probe": None,
         "train_metrics": None,
@@ -365,6 +368,14 @@ def main() -> dict:
 
     if args_cli.iterations > 0:
         recorder = MetricRecorder(runner.agent, rollouts)
+        if args_cli.random_episode_start:
+            # as rsl_rl's init_at_random_ep_len: episodes only end by timeout, so without
+            # this every env resets on the same step and each rollout sees one episode phase.
+            # env.reset() is the wrapper's first (seeded) reset; the trainer's reset() then
+            # returns these observations. evaluate() resets every env, so scoring is unaffected.
+            env.reset()
+            raw = _raw(env)
+            raw.episode_length_buf = torch.randint_like(raw.episode_length_buf, high=int(raw.max_episode_length))
         runner.agent.enable_training_mode(True, apply_to_models=True)
         start = time.time()
         runner.run()
