@@ -66,6 +66,8 @@ parser.add_argument("--screen-envs", type=int, default=None, help="envs for scre
 parser.add_argument("--num_envs", type=int, default=256, help="parallel envs per fine-tuned candidate")
 parser.add_argument("--iterations", type=int, default=100, help="PPO iterations per candidate per generation")
 parser.add_argument("--no-probe", action="store_true", help="skip the per-candidate probe before fine-tuning")
+parser.add_argument("--random-episode-start", action="store_true",
+                    help="desynchronise the envs' episode starts in training (forwarded to the workers)")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--run-dir", type=str, default=None, help="run directory (set to an old run to resume)")
 parser.add_argument("--device", type=str, default=None, help="forwarded to the worker, e.g. cuda:0")
@@ -157,7 +159,8 @@ def train(candidates: list[dict], gen_dir: str, gen: int, run_name: str, group: 
         if args.no_probe:
             extra.append("--no-probe")
         cmd = worker_command(out_dir, num_envs=args.num_envs, iterations=args.iterations, seed=args.seed,
-                             design=cand["design"], checkpoint=checkpoint, device=args.device, extra=extra)
+                             design=cand["design"], checkpoint=checkpoint, device=args.device,
+                             random_episode_start=args.random_episode_start, extra=extra)
         print(f"[evolve] {cand['id']} ({cand['role']}): training design {cand['design']}"
               + (f" (warm start: {checkpoint})" if checkpoint else ""))
         run_worker(cmd, cand["id"])

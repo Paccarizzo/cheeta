@@ -269,6 +269,9 @@ Without `--checkpoint` the design runs passively (zero torques).
 | `scripts/coadapt/train_general.py` | train the design-conditioned general policy |
 | `scripts/coadapt/evolve.py` | evolutionary co-adaptation driver (screening + fine-tuning) |
 | `scripts/coadapt/evolve_ng.py` | nevergrad-driven variant |
+| `scripts/coadapt/evolve_shared.py` | evolution with one shared design-conditioned policy trained on the whole population each generation |
+| `scripts/coadapt/compare_methods.py` | shared-policy vs from-scratch evolution at a matched training budget, then a common from-scratch final test |
+| `scripts/coadapt/plot_compare.py` | plots + budget table of a compare_methods run (matplotlib, no Isaac Sim) |
 | `scripts/coadapt/recheck_designs.py` | retrain the best designs of an evolve run with new seeds |
 | `scripts/coadapt/plot_evolution.py` | plots + tables of an evolve run (matplotlib, no Isaac Sim) |
 | `scripts/coadapt/plot_convergence.py` | plots of a longer-budget recheck: training length and ranking stability |
